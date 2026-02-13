@@ -38,7 +38,8 @@
     "file-type": "^3.9.0",
     "mime": "^1.6.0",
     "node-telegram-bot-api": "^0.67.0",
-    "pump": "^2.0.0"
+    "pump": "^2.0.0",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "babel-cli": "^6.26.0",
@@ -72,5 +73,6 @@
   "bugs": {
     "url": "https://github.com/yagop/node-telegram-bot-api/issues"
   },
-  "homepage": "https://github.com/yagop/node-telegram-bot-api"
+  "homepage": "https://github.com/yagop/node-telegram-bot-api",
+  "packageManager": "pnpm@8.15.0+sha512.ea45517d5285d123eac02c3793505fa1fd6da90a2fc60d1e8d9e0c1e9292886ecfaff513f062b9d1cc8021bb8615033b1ac5bea3b2ee3fc165a6d7034bbe6b03"
 }
