@@ -1,0 +1,184 @@
+#!/usr/bin/env node
+/**
+ * Gemini 服务 API（Fastify）
+ * - 提示词目录: prompts/{role}.txt
+ * - POST /chat 支持两种方式:
+ *   1) JSON: { role, message?, files?: [{ path }|{ data, mime_type }] }
+ *   2) multipart/form-data: role, message, files (上传文件)
+ * - 支持 HTTP_PROXY/HTTPS_PROXY
+ */
+const path = require('path');
+const fs = require('fs');
+const Fastify = require('fastify');
+const rp = require('@cypress/request-promise');
+
+require('dotenv').config();
+
+// 代理修复（与 ws-to-telegram.js 一致）
+const disableProxy = process.env.NO_PROXY === '1' || process.argv.includes('--no-proxy') || process.argv.includes('-n');
+if (!disableProxy) {
+  ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'].forEach((varName) => {
+    const value = process.env[varName];
+    if (value) {
+      if (/^[\d]+$/.test(value)) delete process.env[varName];
+      else if (!value.startsWith('http://') && !value.startsWith('https://') && !value.startsWith('socks://')) {
+        process.env[varName] = `http://${value}`;
+      }
+      if (value.includes(':7897')) {
+        process.env[varName] = (process.env[varName] || value).replace(':7897', ':7890');
+      }
+    }
+  });
+} else {
+  ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'].forEach((varName) => {
+    if (process.env[varName]) delete process.env[varName];
+  });
+}
+
+const ROOT = __dirname;
+const PROMPTS_DIR = path.join(ROOT, 'prompts');
+const PORT = parseInt(process.env.GEMINI_SERVICE_PORT || '3860', 10);
+
+function getPrompt(role) {
+  const safe = role.replace(/[^a-z0-9_]/gi, '');
+  if (!safe || safe !== role) return null;
+  const p = path.join(PROMPTS_DIR, `${safe}.txt`);
+  if (!fs.existsSync(p)) return null;
+  return fs.readFileSync(p, 'utf8').trim();
+}
+
+function resolveFiles(files, basePath = ROOT) {
+  if (!Array.isArray(files) || files.length === 0) return [];
+  const parts = [];
+  for (const f of files) {
+    if (f.path) {
+      const full = path.isAbsolute(f.path) ? f.path : path.join(basePath, f.path);
+      if (!fs.existsSync(full)) continue;
+      const buf = fs.readFileSync(full);
+      const mime = f.mime_type || 'application/octet-stream';
+      if (path.extname(full).toLowerCase() === '.png') parts.push({ mime_type: 'image/png', data: buf.toString('base64') });
+      else if (path.extname(full).toLowerCase() === '.jpg' || path.extname(full).toLowerCase() === '.jpeg') parts.push({ mime_type: 'image/jpeg', data: buf.toString('base64') });
+      else parts.push({ mime_type: mime, data: buf.toString('base64') });
+    } else if (f.data && typeof f.data === 'string') {
+      parts.push({ mime_type: f.mime_type || 'application/octet-stream', data: f.data });
+    }
+  }
+  return parts;
+}
+
+let modelNamesCache = null;
+async function getModels(key) {
+  if (modelNamesCache && modelNamesCache.length > 0) return modelNamesCache;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`;
+  try {
+    const json = await rp.get({ url, json: true, timeout: 10000 });
+    modelNamesCache = (json.models || [])
+      .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map(m => m.name.replace('models/', ''));
+    const flash = modelNamesCache.filter(n => n.toLowerCase().includes('flash'));
+    const other = modelNamesCache.filter(n => !n.toLowerCase().includes('flash'));
+    modelNamesCache = flash.concat(other);
+  } catch {
+    modelNamesCache = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'];
+  }
+  return modelNamesCache;
+}
+
+async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = false) {
+  const models = await getModels(key);
+  const parts = [{ text: systemPrompt }];
+  if (userMessage && userMessage.trim()) parts.push({ text: `\n\n用户输入：${userMessage.trim()}` });
+  for (const fp of fileParts) {
+    parts.push({ inline_data: { mime_type: fp.mime_type, data: fp.data } });
+  }
+  const payload = {
+    contents: [{ parts }],
+    generationConfig: wantJson ? { response_mime_type: 'application/json' } : {},
+  };
+
+  for (const model of models.slice(0, 6)) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+    try {
+      const res = await rp({ url, method: 'POST', body: payload, json: true, timeout: 60000, resolveWithFullResponse: true });
+      return { ok: true, text: res.body.candidates?.[0]?.content?.parts?.[0]?.text || '' };
+    } catch (err) {
+      const sc = err.statusCode || err.response?.statusCode;
+      if (sc === 403 || sc === 404) continue;
+      throw err;
+    }
+  }
+  return { ok: false, error: '所有模型均失败' };
+}
+
+async function parseMultipart(request) {
+  const data = { role: '', message: '', files: [] };
+  const parts = request.parts();
+  for await (const part of parts) {
+    if (part.type === 'field') {
+      const value = String(part.value ?? '');
+      if (part.fieldname === 'role') data.role = value;
+      else if (part.fieldname === 'message') data.message = value;
+    } else if (part.type === 'file' || part.file) {
+      const buf = await part.toBuffer();
+      const mime = part.mimetype || 'application/octet-stream';
+      data.files.push({ data: buf.toString('base64'), mime_type: mime });
+    }
+  }
+  return data;
+}
+
+async function main() {
+  const fastify = Fastify({ logger: false });
+  await fastify.register(require('@fastify/cors'), { origin: '*' });
+  await fastify.register(require('@fastify/multipart'), { limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
+
+  fastify.get('/health', async () => ({ ok: true }));
+
+  fastify.post('/chat', async (request, reply) => {
+    let role; let message = ''; let files = [];
+    const ct = (request.headers['content-type'] || '').toLowerCase();
+    if (ct.includes('multipart/form-data')) {
+      const data = await parseMultipart(request);
+      role = data.role;
+      message = data.message;
+      files = data.files;
+    } else {
+      const body = request.body || {};
+      role = body.role;
+      message = body.message || '';
+      files = body.files || [];
+    }
+    if (!role || typeof role !== 'string') {
+      return reply.status(400).send({ error: '缺少 role 参数' });
+    }
+    const prompt = getPrompt(role);
+    if (!prompt) {
+      return reply.status(404).send({ error: `未找到角色提示词: ${role}，请在 prompts/${role}.txt 添加` });
+    }
+    const key = (process.env.GEMINI_API_KEY || '').trim();
+    if (!key) {
+      return reply.status(500).send({ error: '未配置 GEMINI_API_KEY' });
+    }
+    try {
+      const fileParts = resolveFiles(files);
+      const wantJson = role === 'k_line_analysis';
+      const result = await callGemini(key, prompt, message, fileParts, wantJson);
+      if (!result.ok) {
+        return reply.status(500).send({ error: result.error });
+      }
+      return { text: result.text };
+    } catch (e) {
+      console.error('[gemini_client]', e);
+      return reply.status(500).send({ error: String(e.message || e) });
+    }
+  });
+
+  await fastify.listen({ port: PORT, host: '0.0.0.0' });
+  console.log(`[gemini_client] Gemini 服务已启动 http://127.0.0.1:${PORT}`);
+  console.log('[gemini_client] POST /chat  JSON: { role, message?, files?: [{ path }|{ data, mime_type }] } 或 multipart: role, message, files');
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
