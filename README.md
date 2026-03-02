@@ -127,3 +127,25 @@ Copyright © 2019 Yago
 [experimental]:https://github.com/yagop/node-telegram-bot-api/tree/master/doc/experimental.md
 [tg-channel]:https://telegram.me/node_telegram_bot_api
 [tg-group]:https://t.me/+UTbprHdcw0JdZdbL
+
+
+## 主要使用的两个对外服务
+
+# 启动两个服务
+pm2 start ecosystem.config.js
+
+# 查看状态
+pm2 status
+
+# 查看日志
+pm2 logs
+
+# 分别查看
+pm2 logs telegram-ws-bot
+pm2 logs gemini-client
+
+# 停止所有
+pm2 stop all
+
+# 删除所有
+pm2 delete all

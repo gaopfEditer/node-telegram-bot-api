@@ -32,13 +32,13 @@
   "dependencies": {
     "@cypress/request": "^3.0.8",
     "@cypress/request-promise": "^5.0.0",
-    "@fastify/cors": "^10.1.0",
-    "@fastify/multipart": "^9.4.0",
+    "@fastify/cors": "8",
+    "@fastify/multipart": "7",
     "array.prototype.findindex": "^2.0.2",
     "bl": "^1.2.3",
     "debug": "^3.2.7",
     "eventemitter3": "^3.0.0",
-    "fastify": "^5.7.4",
+    "fastify": "^4.29.1",
     "file-type": "^3.9.0",
     "mime": "^1.6.0",
     "node-telegram-bot-api": "^0.67.0",
@@ -77,6 +77,5 @@
   "bugs": {
     "url": "https://github.com/yagop/node-telegram-bot-api/issues"
   },
-  "homepage": "https://github.com/yagop/node-telegram-bot-api",
-  "packageManager": "pnpm@8.15.0+sha512.ea45517d5285d123eac02c3793505fa1fd6da90a2fc60d1e8d9e0c1e9292886ecfaff513f062b9d1cc8021bb8615033b1ac5bea3b2ee3fc165a6d7034bbe6b03"
+  "homepage": "https://github.com/yagop/node-telegram-bot-api"
 }
