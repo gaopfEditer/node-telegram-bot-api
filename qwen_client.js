@@ -40,56 +40,21 @@ const CHAT_MODELS = ['qwen-max', 'qwen-plus', 'qwen-turbo', 'qwen-flash'];
 const IMAGE_MODELS = ['qwen-image-2.0-pro', 'wanx-v1', 'wanx-v2', 'wan2.5-t2i-preview', 'wan2.6-t2i'];
 
 /**
- * 生文：Chat Completions
+ * 生文：Chat Completions（为兼容 Node 16，这里统一使用非流式）
  */
 async function callQwenChat(key, messages, options = {}) {
   const model = options.model || 'qwen-plus';
-  const stream = options.stream !== false;
   const url = `${CHAT_BASE}/chat/completions`;
   const body = {
     model: CHAT_MODELS.includes(model) ? model : 'qwen-plus',
     messages,
-    stream,
+    stream: false,
   };
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
 
-  if (!stream) {
-    const res = await rp({ url, method: 'POST', body, json: true, headers, timeout: 60000, resolveWithFullResponse: true });
-    const text = res.body?.choices?.[0]?.message?.content ?? '';
-    return { ok: true, text };
-  }
-
-  const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Qwen Chat ${response.status}: ${err}`);
-  }
-  return {
-    ok: true,
-    stream: async function* () {
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split('\n');
-        buf = lines.pop() || '';
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6).trim();
-            if (data === '[DONE]' || !data) continue;
-            try {
-              const json = JSON.parse(data);
-              const delta = json.choices?.[0]?.delta?.content;
-              if (delta) yield delta;
-            } catch (_) {}
-          }
-        }
-      }
-    },
-  };
+  const res = await rp({ url, method: 'POST', body, json: true, headers, timeout: 60000, resolveWithFullResponse: true });
+  const text = res.body?.choices?.[0]?.message?.content ?? '';
+  return { ok: true, text };
 }
 
 /**
@@ -176,13 +141,8 @@ async function main() {
       return reply.status(400).send({ error: '缺少 messages 数组' });
     }
     try {
-      const stream = body.stream !== false;
-      const result = await callQwenChat(key, messages, { model: body.model, stream });
+      const result = await callQwenChat(key, messages, { model: body.model });
       if (!result.ok) return reply.status(500).send({ error: result.error });
-      if (result.stream) {
-        reply.header('Content-Type', 'text/plain; charset=utf-8');
-        return reply.send(Readable.from(result.stream()));
-      }
       return reply.send({ text: result.text });
     } catch (e) {
       console.error('[qwen_client]', e);

@@ -85,7 +85,8 @@ async function getModels(key) {
   return modelNamesCache;
 }
 
-async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = false, stream = true) {
+// 为兼容 Node 16，这里统一使用非流式调用（generateContent），不再依赖 fetch/SSE
+async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = false) {
   const models = await getModels(key);
   const parts = [{ text: systemPrompt }];
   if (userMessage && userMessage.trim()) parts.push({ text: `\n\n用户输入：${userMessage.trim()}` });
@@ -98,60 +99,7 @@ async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = 
     tools: [{ google_search: {} }],
   };
 
-  // 流式：使用 streamGenerateContent + SSE
-  if (stream) {
-    for (const model of models.slice(0, 6)) {
-      for (const withSearch of [true, false]) {
-        const body = withSearch ? payload : { contents: payload.contents, generationConfig: payload.generationConfig };
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${key}&alt=sse`;
-        try {
-          const response = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-          if (!response.ok) {
-            if (response.status === 400 && withSearch) continue;
-            if (response.status === 403 || response.status === 404) break;
-            const errText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errText}`);
-          }
-          return {
-            ok: true,
-            stream: async function* () {
-              const reader = response.body.getReader();
-              const decoder = new TextDecoder();
-              let buf = '';
-              while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                buf += decoder.decode(value, { stream: true });
-                const lines = buf.split('\n');
-                buf = lines.pop() || '';
-                for (const line of lines) {
-                  if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data.trim() === '' || data === '[DONE]') continue;
-                    try {
-                      const json = JSON.parse(data);
-                      const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-                      if (text) yield text;
-                    } catch (_) { /* 忽略单条解析失败 */ }
-                  }
-                }
-              }
-            },
-          };
-        } catch (err) {
-          if (err.name === 'AbortError' || err.code === 'ECONNRESET') break;
-          throw err;
-        }
-      }
-    }
-    return { ok: false, error: '所有模型均失败（流式）' };
-  }
-
-  // 非流式：原有 generateContent
+  // 非流式：generateContent
   for (const model of models.slice(0, 6)) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
     for (const withSearch of [true, false]) {
@@ -322,14 +270,9 @@ async function main() {
     try {
       const fileParts = resolveFiles(files);
       const wantJson = role === 'k_line_analysis';
-      const stream = streamRequested;
-      const result = await callGemini(key, prompt, message, fileParts, wantJson, stream);
+      const result = await callGemini(key, prompt, message, fileParts, wantJson);
       if (!result.ok) {
         return reply.status(500).send({ error: result.error });
-      }
-      if (result.stream) {
-        reply.header('Content-Type', 'text/plain; charset=utf-8');
-        return reply.send(Readable.from(result.stream()));
       }
       return reply.send({ text: result.text });
     } catch (e) {
