@@ -19,7 +19,20 @@ module.exports = {
       cwd: __dirname,
       env: {
         NODE_ENV: 'production',
-        NO_PROXY: '1',  // 服务端直连，不需要代理
+        NO_PROXY: '1',
+      },
+      autorestart: true,
+      max_restarts: 10,
+      watch: false,
+      max_memory_restart: '500M',
+    },
+    {
+      name: 'qwen-client',
+      script: 'qwen_client.js',
+      cwd: __dirname,
+      env: {
+        NODE_ENV: 'production',
+        NO_PROXY: '1',
       },
       autorestart: true,
       max_restarts: 10,

@@ -9,6 +9,7 @@
  */
 const path = require('path');
 const fs = require('fs');
+const { Readable } = require('stream');
 const Fastify = require('fastify');
 const rp = require('@cypress/request-promise');
 
@@ -84,7 +85,7 @@ async function getModels(key) {
   return modelNamesCache;
 }
 
-async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = false) {
+async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = false, stream = true) {
   const models = await getModels(key);
   const parts = [{ text: systemPrompt }];
   if (userMessage && userMessage.trim()) parts.push({ text: `\n\n用户输入：${userMessage.trim()}` });
@@ -94,20 +95,137 @@ async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = 
   const payload = {
     contents: [{ parts }],
     generationConfig: wantJson ? { response_mime_type: 'application/json' } : {},
+    tools: [{ google_search: {} }],
   };
 
+  // 流式：使用 streamGenerateContent + SSE
+  if (stream) {
+    for (const model of models.slice(0, 6)) {
+      for (const withSearch of [true, false]) {
+        const body = withSearch ? payload : { contents: payload.contents, generationConfig: payload.generationConfig };
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${key}&alt=sse`;
+        try {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          if (!response.ok) {
+            if (response.status === 400 && withSearch) continue;
+            if (response.status === 403 || response.status === 404) break;
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+          }
+          return {
+            ok: true,
+            stream: async function* () {
+              const reader = response.body.getReader();
+              const decoder = new TextDecoder();
+              let buf = '';
+              while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buf += decoder.decode(value, { stream: true });
+                const lines = buf.split('\n');
+                buf = lines.pop() || '';
+                for (const line of lines) {
+                  if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data.trim() === '' || data === '[DONE]') continue;
+                    try {
+                      const json = JSON.parse(data);
+                      const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+                      if (text) yield text;
+                    } catch (_) { /* 忽略单条解析失败 */ }
+                  }
+                }
+              }
+            },
+          };
+        } catch (err) {
+          if (err.name === 'AbortError' || err.code === 'ECONNRESET') break;
+          throw err;
+        }
+      }
+    }
+    return { ok: false, error: '所有模型均失败（流式）' };
+  }
+
+  // 非流式：原有 generateContent
   for (const model of models.slice(0, 6)) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+    for (const withSearch of [true, false]) {
+      const body = withSearch ? payload : { contents: payload.contents, generationConfig: payload.generationConfig };
+      try {
+        const res = await rp({ url, method: 'POST', body, json: true, timeout: 60000, resolveWithFullResponse: true });
+        return { ok: true, text: res.body.candidates?.[0]?.content?.parts?.[0]?.text || '' };
+      } catch (err) {
+        const sc = err.statusCode || err.response?.statusCode;
+        if (sc === 403 || sc === 404) break;
+        if (sc === 400 && withSearch) continue;
+        throw err;
+      }
+    }
+  }
+  return { ok: false, error: '所有模型均失败' };
+}
+
+/** 支持图片生成的模型（按优先级） */
+const IMAGE_MODELS = [
+  'gemini-2.5-flash-image',
+];
+
+/**
+ * 调用 Gemini 生成图片
+ * @param {string} key - API Key
+ * @param {string} prompt - 图片描述
+ * @param {object} options - { aspectRatio?, numberOfImages?, referenceImages? [{ mime_type, data }] }
+ * @returns {Promise<{ ok: true, images: [{ mimeType, data }], text?: string } | { ok: false, error: string }>}
+ */
+async function callGeminiImage(key, prompt, options = {}) {
+  const { aspectRatio = '1:1', referenceImages = [] } = options;
+  const promptText = aspectRatio && aspectRatio !== '1:1'
+    ? `Aspect ratio ${aspectRatio}. ${prompt}`
+    : prompt;
+  const parts = [{ text: promptText }];
+  for (const img of referenceImages) {
+    if (img.data) parts.push({ inline_data: { mime_type: img.mime_type || 'image/png', data: img.data } });
+  }
+  const payload = {
+    contents: [{ parts }],
+    generationConfig: {
+      responseModalities: ['TEXT', 'IMAGE'],
+      responseMimeType: 'text/plain',
+    },
+  };
+
+  for (const model of IMAGE_MODELS) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
     try {
-      const res = await rp({ url, method: 'POST', body: payload, json: true, timeout: 60000, resolveWithFullResponse: true });
-      return { ok: true, text: res.body.candidates?.[0]?.content?.parts?.[0]?.text || '' };
+      const res = await rp({ url, method: 'POST', body: payload, json: true, timeout: 120000, resolveWithFullResponse: true });
+      const body = res.body;
+      const candidates = body.candidates;
+      if (!candidates || !candidates[0] || !candidates[0].content) continue;
+      const contentParts = candidates[0].content.parts || [];
+      const images = [];
+      let text = '';
+      for (const part of contentParts) {
+        if (part.inlineData) {
+          images.push({ mimeType: part.inlineData.mimeType || 'image/png', data: part.inlineData.data });
+        } else if (part.text) {
+          text += part.text;
+        }
+      }
+      if (images.length > 0) {
+        return { ok: true, images, text: text.trim() || undefined };
+      }
     } catch (err) {
       const sc = err.statusCode || err.response?.statusCode;
       if (sc === 403 || sc === 404) continue;
       throw err;
     }
   }
-  return { ok: false, error: '所有模型均失败' };
+  return { ok: false, error: '无支持图片生成的模型或生成失败' };
 }
 
 async function parseMultipart(request) {
@@ -118,6 +236,9 @@ async function parseMultipart(request) {
       const value = String(part.value ?? '');
       if (part.fieldname === 'role') data.role = value;
       else if (part.fieldname === 'message') data.message = value;
+      else if (part.fieldname === 'prompt') data.prompt = value;
+      else if (part.fieldname === 'stream') data.stream = value;
+      else if (part.fieldname === 'aspectRatio' || part.fieldname === 'aspect_ratio') data.aspectRatio = value;
     } else if (part.type === 'file' || part.file) {
       const buf = await part.toBuffer();
       const mime = part.mimetype || 'application/octet-stream';
@@ -134,19 +255,58 @@ async function main() {
 
   fastify.get('/health', async () => ({ ok: true }));
 
+  fastify.post('/image', async (request, reply) => {
+    let prompt = '';
+    let aspectRatio = '1:1';
+    let files = [];
+    const ct = (request.headers['content-type'] || '').toLowerCase();
+    if (ct.includes('multipart/form-data')) {
+      const data = await parseMultipart(request);
+      prompt = data.prompt || data.message || '';
+      aspectRatio = data.aspectRatio || data.aspect_ratio || '1:1';
+      files = data.files || [];
+    } else {
+      const body = request.body || {};
+      prompt = body.prompt || body.message || '';
+      aspectRatio = body.aspectRatio || body.aspect_ratio || '1:1';
+      files = body.files || [];
+    }
+    if (!prompt || !prompt.trim()) {
+      return reply.status(400).send({ error: '缺少 prompt 参数' });
+    }
+    const key = (process.env.GEMINI_API_KEY || '').trim();
+    if (!key) {
+      return reply.status(500).send({ error: '未配置 GEMINI_API_KEY' });
+    }
+    try {
+      const fileParts = resolveFiles(files);
+      const referenceImages = fileParts.map(fp => ({ mime_type: fp.mime_type, data: fp.data }));
+      const result = await callGeminiImage(key, prompt.trim(), { aspectRatio, referenceImages });
+      if (!result.ok) {
+        return reply.status(500).send({ error: result.error });
+      }
+      return reply.send({ images: result.images, text: result.text });
+    } catch (e) {
+      console.error('[gemini_client]', e);
+      return reply.status(500).send({ error: String(e.message || e) });
+    }
+  });
+
   fastify.post('/chat', async (request, reply) => {
-    let role; let message = ''; let files = [];
+    let role; let message = ''; let files = []; let streamRequested = true;
     const ct = (request.headers['content-type'] || '').toLowerCase();
     if (ct.includes('multipart/form-data')) {
       const data = await parseMultipart(request);
       role = data.role;
       message = data.message;
       files = data.files;
+      if (data.stream === 'false' || data.stream === '0') streamRequested = false;
     } else {
       const body = request.body || {};
       role = body.role;
       message = body.message || '';
       files = body.files || [];
+      if (body.stream === false) streamRequested = false;
     }
     if (!role || typeof role !== 'string') {
       return reply.status(400).send({ error: '缺少 role 参数' });
@@ -162,11 +322,16 @@ async function main() {
     try {
       const fileParts = resolveFiles(files);
       const wantJson = role === 'k_line_analysis';
-      const result = await callGemini(key, prompt, message, fileParts, wantJson);
+      const stream = streamRequested;
+      const result = await callGemini(key, prompt, message, fileParts, wantJson, stream);
       if (!result.ok) {
         return reply.status(500).send({ error: result.error });
       }
-      return { text: result.text };
+      if (result.stream) {
+        reply.header('Content-Type', 'text/plain; charset=utf-8');
+        return reply.send(Readable.from(result.stream()));
+      }
+      return reply.send({ text: result.text });
     } catch (e) {
       console.error('[gemini_client]', e);
       return reply.status(500).send({ error: String(e.message || e) });
@@ -176,6 +341,7 @@ async function main() {
   await fastify.listen({ port: PORT, host: '0.0.0.0' });
   console.log(`[gemini_client] Gemini 服务已启动 http://127.0.0.1:${PORT}`);
   console.log('[gemini_client] POST /chat  JSON: { role, message?, files?: [{ path }|{ data, mime_type }] } 或 multipart: role, message, files');
+  console.log('[gemini_client] POST /image JSON: { prompt, aspectRatio?, files? } 或 multipart');
 }
 
 main().catch((err) => {
