@@ -128,7 +128,7 @@ if (disableProxy) {
 const bot = new TelegramBot(TOKEN, botOptions);
 
 // 格式化消息内容
-function formatMessage(data) {
+function formatTVMessage(data) {
   try {
     if (data.type === 'message_received' && data.message) {
       const msg = data.message;
@@ -227,12 +227,19 @@ function connectWebSocket() {
           return;
         }
         
-        // 格式化消息
-        const formattedMessage = formatMessage(messageData);
+        if(messageData.message.source === 'tradingview') {
+          const formattedMessage = formatTVMessage(messageData);
+          await sendToTelegram(formattedMessage);
+          console.log(''); // 空行分隔
+        } else if(messageData.message.source === 'whisper'){
+          await sendToTelegram("🚗 发车了！");
+        }
+        // // 格式化消息
+        // const formattedMessage = formatTVMessage(messageData);
         
-        // 发送到 Telegram
-        await sendToTelegram(formattedMessage);
-        console.log(''); // 空行分隔
+        // // 发送到 Telegram
+        // await sendToTelegram(formattedMessage);
+        // console.log(''); // 空行分隔
         
       } catch (error) {
         console.error('❌ 处理消息失败:', error.message);
