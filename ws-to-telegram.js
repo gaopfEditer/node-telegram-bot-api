@@ -149,6 +149,9 @@ function formatTVMessage(data) {
       if (metadata.type) {
         formattedMsg += `📈 *类型*: ${metadata.type}\n`;
       }
+      if (metadata.period) {
+        formattedMsg += `⏰ *周期*: ${metadata.period}\n`;
+      }
       if (metadata.time) {
         formattedMsg += `⏰ *时间*: ${metadata.time}\n`;
       }
