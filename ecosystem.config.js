@@ -19,7 +19,7 @@ module.exports = {
       cwd: __dirname,
       env: {
         NODE_ENV: 'production',
-        NO_PROXY: '1',
+        // NO_PROXY: '1',
       },
       autorestart: true,
       max_restarts: 10,
