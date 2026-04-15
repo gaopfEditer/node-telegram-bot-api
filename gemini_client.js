@@ -85,6 +85,22 @@ async function getModels(key) {
   return modelNamesCache;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 是否对同一请求再次发起 rp（429 / 408 / 5xx / 无 HTTP 状态的网络与超时） */
+function isGeminiRpRetryable(sc, err) {
+  if (sc === 429 || sc === 408) return true;
+  if (typeof sc === 'number' && sc >= 500 && sc < 600) return true;
+  if (sc != null) return false;
+  const code = err && (err.code || (err.cause && err.cause.code));
+  const c = code != null ? String(code) : '';
+  const msg = String((err && err.message) || '');
+  if (/timeout|timed out/i.test(msg)) return true;
+  return ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'EAI_AGAIN', 'ENOTFOUND', 'ESOCKETTIMEDOUT', 'ECONNABORTED'].includes(c);
+}
+
 // 为兼容 Node 16，这里统一使用非流式调用（generateContent），不再依赖 fetch/SSE
 async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = false) {
   const models = await getModels(key);
@@ -99,19 +115,43 @@ async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = 
     tools: [{ google_search: {} }],
   };
 
-  // 非流式：generateContent
+  // 非流式：generateContent（同一 body 下对可恢复错误默认再重试 2 次，共 3 次；可用 GEMINI_RP_EXTRA_RETRIES 覆盖）
+  const rpExtraRetries = Math.max(0, parseInt(process.env.GEMINI_RP_EXTRA_RETRIES || '2', 10));
+  const maxAttempts = rpExtraRetries + 1;
+
   for (const model of models.slice(0, 6)) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+    searchLoop:
     for (const withSearch of [true, false]) {
       const body = withSearch ? payload : { contents: payload.contents, generationConfig: payload.generationConfig };
-      try {
-        const res = await rp({ url, method: 'POST', body, json: true, timeout: 60000, resolveWithFullResponse: true });
-        return { ok: true, text: res.body.candidates?.[0]?.content?.parts?.[0]?.text || '' };
-      } catch (err) {
-        const sc = err.statusCode || err.response?.statusCode;
-        if (sc === 403 || sc === 404) break;
-        if (sc === 400 && withSearch) continue;
-        throw err;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          const res = await rp({ url, method: 'POST', body, json: true, timeout: 60000, resolveWithFullResponse: true });
+          return { ok: true, text: res.body.candidates?.[0]?.content?.parts?.[0]?.text || '' };
+        } catch (err) {
+          const sc = err.statusCode || err.response?.statusCode;
+          const errBody = err.error || err.response?.body;
+          const errMsg = typeof errBody === 'object' && errBody !== null
+            ? (errBody.error?.message || JSON.stringify(errBody).slice(0, 300))
+            : String(errBody || err.message || err);
+          if (sc === 403 || sc === 404) {
+            console.warn('[gemini_client] 跳过模型', model, sc, errMsg);
+            break searchLoop;
+          }
+          if (sc === 400 && withSearch) {
+            console.warn('[gemini_client] 带 google_search 失败，重试不带工具 model=', model, errMsg);
+            continue searchLoop;
+          }
+          const canRetry = isGeminiRpRetryable(sc, err) && attempt + 1 < maxAttempts;
+          if (canRetry) {
+            const delayMs = 400 * (attempt + 1);
+            console.warn('[gemini_client] 可恢复错误，重试', `${attempt + 1}/${rpExtraRetries}`, `(${attempt + 2}/${maxAttempts} 次请求) model=`, model, 'withSearch=', withSearch, 'sc=', sc, 'delayMs=', delayMs, errMsg);
+            await sleep(delayMs);
+            continue;
+          }
+          console.error('[gemini_client] Gemini 请求失败 model=', model, 'withSearch=', withSearch, sc, errMsg);
+          throw err;
+        }
       }
     }
   }
