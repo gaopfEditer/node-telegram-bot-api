@@ -68,20 +68,15 @@ function resolveFiles(files, basePath = ROOT) {
 }
 
 let modelNamesCache = null;
-async function getModels(key) {
+async function getModels() {
   if (modelNamesCache && modelNamesCache.length > 0) return modelNamesCache;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`;
-  try {
-    const json = await rp.get({ url, json: true, timeout: 10000 });
-    modelNamesCache = (json.models || [])
-      .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
-      .map(m => m.name.replace('models/', ''));
-    const flash = modelNamesCache.filter(n => n.toLowerCase().includes('flash'));
-    const other = modelNamesCache.filter(n => !n.toLowerCase().includes('flash'));
-    modelNamesCache = flash.concat(other);
-  } catch {
-    modelNamesCache = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'];
-  }
+  const configured = String(process.env.GEMINI_MODELS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  modelNamesCache = configured.length > 0
+    ? configured
+    : ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-pro'];
   return modelNamesCache;
 }
 
@@ -103,7 +98,7 @@ function isGeminiRpRetryable(sc, err) {
 
 // 为兼容 Node 16，这里统一使用非流式调用（generateContent），不再依赖 fetch/SSE
 async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = false) {
-  const models = await getModels(key);
+  const models = await getModels();
   const parts = [{ text: systemPrompt }];
   if (userMessage && userMessage.trim()) parts.push({ text: `\n\n用户输入：${userMessage.trim()}` });
   for (const fp of fileParts) {
@@ -119,6 +114,7 @@ async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = 
   const rpExtraRetries = Math.max(0, parseInt(process.env.GEMINI_RP_EXTRA_RETRIES || '2', 10));
   const maxAttempts = rpExtraRetries + 1;
 
+  modelLoop:
   for (const model of models.slice(0, 6)) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
     searchLoop:
@@ -144,10 +140,15 @@ async function callGemini(key, systemPrompt, userMessage, fileParts, wantJson = 
           }
           const canRetry = isGeminiRpRetryable(sc, err) && attempt + 1 < maxAttempts;
           if (canRetry) {
-            const delayMs = 400 * (attempt + 1);
+            // 503 常见于模型高负载，至少等 2 秒避免高频打点；其他错误维持原有退避节奏
+            const delayMs = sc === 503 ? 2000 : 400 * (attempt + 1);
             console.warn('[gemini_client] 可恢复错误，重试', `${attempt + 1}/${rpExtraRetries}`, `(${attempt + 2}/${maxAttempts} 次请求) model=`, model, 'withSearch=', withSearch, 'sc=', sc, 'delayMs=', delayMs, errMsg);
             await sleep(delayMs);
             continue;
+          }
+          if (isGeminiRpRetryable(sc, err)) {
+            console.warn('[gemini_client] 可恢复错误重试耗尽，切换模型 model=', model, 'withSearch=', withSearch, 'sc=', sc, errMsg);
+            continue modelLoop;
           }
           console.error('[gemini_client] Gemini 请求失败 model=', model, 'withSearch=', withSearch, sc, errMsg);
           throw err;
@@ -220,14 +221,16 @@ async function parseMultipart(request) {
   const data = { role: '', message: '', files: [] };
   const parts = request.parts();
   for await (const part of parts) {
-    if (part.type === 'field') {
+    const isFilePart = part && (part.type === 'file' || part.file);
+    const isFieldPart = part && !isFilePart && Object.prototype.hasOwnProperty.call(part, 'value');
+    if (isFieldPart) {
       const value = String(part.value ?? '');
       if (part.fieldname === 'role') data.role = value;
       else if (part.fieldname === 'message') data.message = value;
       else if (part.fieldname === 'prompt') data.prompt = value;
       else if (part.fieldname === 'stream') data.stream = value;
       else if (part.fieldname === 'aspectRatio' || part.fieldname === 'aspect_ratio') data.aspectRatio = value;
-    } else if (part.type === 'file' || part.file) {
+    } else if (isFilePart) {
       const buf = await part.toBuffer();
       const mime = part.mimetype || 'application/octet-stream';
       data.files.push({ data: buf.toString('base64'), mime_type: mime });
