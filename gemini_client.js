@@ -247,10 +247,12 @@ async function main() {
   fastify.get('/health', async () => ({ ok: true }));
 
   fastify.post('/image', async (request, reply) => {
+    const reqStart = Date.now();
     let prompt = '';
     let aspectRatio = '1:1';
     let files = [];
     const ct = (request.headers['content-type'] || '').toLowerCase();
+    const reqType = ct.includes('multipart/form-data') ? 'multipart' : 'json';
     if (ct.includes('multipart/form-data')) {
       const data = await parseMultipart(request);
       prompt = data.prompt || data.message || '';
@@ -262,6 +264,7 @@ async function main() {
       aspectRatio = body.aspectRatio || body.aspect_ratio || '1:1';
       files = body.files || [];
     }
+    console.log('[gemini_client] /image req', 'type=', reqType, 'promptLen=', String(prompt || '').trim().length, 'aspectRatio=', aspectRatio, 'files=', Array.isArray(files) ? files.length : 0);
     if (!prompt || !prompt.trim()) {
       return reply.status(400).send({ error: '缺少 prompt 参数' });
     }
@@ -274,8 +277,10 @@ async function main() {
       const referenceImages = fileParts.map(fp => ({ mime_type: fp.mime_type, data: fp.data }));
       const result = await callGeminiImage(key, prompt.trim(), { aspectRatio, referenceImages });
       if (!result.ok) {
+        console.warn('[gemini_client] /image fail', 'ms=', Date.now() - reqStart, 'error=', result.error);
         return reply.status(500).send({ error: result.error });
       }
+      console.log('[gemini_client] /image ok', 'ms=', Date.now() - reqStart, 'images=', result.images?.length || 0, 'textLen=', (result.text || '').length);
       return reply.send({ images: result.images, text: result.text });
     } catch (e) {
       console.error('[gemini_client]', e);
@@ -284,21 +289,24 @@ async function main() {
   });
 
   fastify.post('/chat', async (request, reply) => {
-    let role; let message = ''; let files = []; let streamRequested = true;
+    const reqStart = Date.now();
+    let role; let message = ''; let files = []; let streamRequested = false;
     const ct = (request.headers['content-type'] || '').toLowerCase();
+    const reqType = ct.includes('multipart/form-data') ? 'multipart' : 'json';
     if (ct.includes('multipart/form-data')) {
       const data = await parseMultipart(request);
       role = data.role;
       message = data.message;
       files = data.files;
-      if (data.stream === 'false' || data.stream === '0') streamRequested = false;
+      if (data.stream === 'true' || data.stream === '1') streamRequested = true;
     } else {
       const body = request.body || {};
       role = body.role;
       message = body.message || '';
       files = body.files || [];
-      if (body.stream === false) streamRequested = false;
+      if (body.stream === true || body.stream === 'true' || body.stream === 1 || body.stream === '1') streamRequested = true;
     }
+    console.log('[gemini_client] /chat req', 'type=', reqType, 'role=', role || '', 'msgLen=', String(message || '').trim().length, 'files=', Array.isArray(files) ? files.length : 0, 'stream=', streamRequested);
     if (!role || typeof role !== 'string') {
       return reply.status(400).send({ error: '缺少 role 参数' });
     }
@@ -315,8 +323,11 @@ async function main() {
       const wantJson = role === 'k_line_analysis';
       const result = await callGemini(key, prompt, message, fileParts, wantJson);
       if (!result.ok) {
+        console.warn('[gemini_client] /chat fail', 'ms=', Date.now() - reqStart, 'role=', role, 'error=', result.error);
         return reply.status(500).send({ error: result.error });
       }
+      const preview = String(result.text || '').slice(0, 250).replace(/\s+/g, ' ');
+      console.log('[gemini_client] /chat ok', 'ms=', Date.now() - reqStart, 'role=', role, 'textLen=', (result.text || '').length, 'preview150=', preview);
       return reply.send({ text: result.text });
     } catch (e) {
       console.error('[gemini_client]', e);
