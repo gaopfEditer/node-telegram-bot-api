@@ -1,25 +1,39 @@
 /**
  * WebSocket 消息监听并转发到 Telegram 群组
- * 
+ *
  * 功能：
  * 1. 连接到 WebSocket: wss://bz.a.gaopf.top/api/ws
  * 2. 监听消息并解析
- * 3. 将消息转发到 Telegram 群组（默认: -5279508223）
- * 
+ * 3. 将消息转发到 Telegram 群组（由环境变量配置）
+ * 4. HTTP 服务（Fastify）：按 category 路由到不同群组并格式化后发送
+ *
  * 使用方法：
  * 1. 在 .env 文件中配置：
  *    - TEST_TELEGRAM_TOKEN: 机器人 Token
- *    - TARGET_GROUP_ID: 目标群组 ID（默认: -5279508223）
- * 
+ *    - TARGET_GROUP_ID 或 TEST_GROUP_ID: WebSocket 默认目标群组 ID（二选一，前者优先）
+ *    - TELEGRAM_CATEGORY_MAP: 可选，JSON 字符串，如 {"tradingview":"-5279508223","whisper":"-100..."}
+ *      未配置时也可在项目根目录放置 telegram_category_map.json（同结构）。
+ *      若两者皆无，HTTP /forward 将回退使用上述默认群组 ID。
+ *    - TELEGRAM_FORWARD_PORT: HTTP 端口，默认 3861
+ *    - TELEGRAM_FORWARD_DISABLE=1: 不启动 HTTP 服务
+ *    - TELEGRAM_BOT_DIRECT=1: 仅 Telegram Bot API 不走 HTTP(S)_PROXY（避免代理 TLS 握手失败；
+ *      WebSocket 仍可能使用系统代理，需全局禁代理请用 --no-proxy）
+ *
  * 2. 运行: node ws-to-telegram.js
- * 
- * 3. 可选参数：
+ *
+ * 3. HTTP 转发示例：
+ *    curl -X POST http://127.0.0.1:3861/forward -H "Content-Type: application/json" \
+ *      -d "{\"category\":\"tradingview\",\"content\":\"{\\\"type\\\":\\\"message_received\\\",...}\"}"
+ *
+ * 4. 可选参数：
  *    --chat-id <ID> : 指定目标群组 ID
  *    --no-proxy     : 禁用代理
  */
 
 // 加载环境变量
 require('dotenv').config();
+const path = require('path');
+const fs = require('fs');
 
 // 检查是否要禁用代理
 const disableProxy = process.env.NO_PROXY === '1' || process.argv.includes('--no-proxy') || process.argv.includes('-n');
@@ -87,13 +101,18 @@ if (chatIdIndex !== -1 && process.argv[chatIdIndex + 1]) {
   targetChatId = parseInt(process.argv[chatIdIndex + 1], 10);
 }
 
-// 如果没有通过命令行指定，则从环境变量获取，默认使用 -5279508223
+// 如果没有通过命令行指定，则从环境变量读取（与测试脚本一致：支持 TEST_GROUP_ID）
 if (!targetChatId) {
-  if (process.env.TARGET_GROUP_ID) {
-    targetChatId = parseInt(process.env.TARGET_GROUP_ID, 10);
-  } else {
-    targetChatId = -5279508223; // 默认群组 ID
+  const fromEnv = process.env.TARGET_GROUP_ID || process.env.TEST_GROUP_ID;
+  if (fromEnv) {
+    targetChatId = parseInt(String(fromEnv).trim(), 10);
   }
+}
+
+if (!targetChatId || Number.isNaN(targetChatId)) {
+  console.error('❌ 错误：未配置目标群组 ID');
+  console.log('\n请在 .env 中设置 TARGET_GROUP_ID 或 TEST_GROUP_ID，或使用: node ws-to-telegram.js --chat-id <群组ID>');
+  process.exit(1);
 }
 
 if (!TOKEN) {
@@ -108,10 +127,16 @@ const botOptions = {
   request: {}
 };
 
+/** 仅 Bot API 直连：全局仍可有 HTTP_PROXY（给 Gemini 等用），避免 Telegram 经代理 TLS 失败 */
+const telegramBotDirect = process.env.TELEGRAM_BOT_DIRECT === '1' || process.env.TELEGRAM_API_DIRECT === '1';
+
 // 配置代理（如果不禁用）
 if (disableProxy) {
   botOptions.request.proxy = false;
-  console.log('ℹ️  已禁用代理，使用直连\n');
+  console.log('ℹ️  已禁用代理，Telegram 使用直连\n');
+} else if (telegramBotDirect) {
+  botOptions.request.proxy = false;
+  console.log('ℹ️  Telegram Bot API 使用直连（TELEGRAM_BOT_DIRECT=1），不经过 HTTP_PROXY/HTTPS_PROXY\n');
 } else {
   const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
   const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
@@ -120,12 +145,112 @@ if (disableProxy) {
   if (proxyUrl) {
     botOptions.request.proxy = proxyUrl;
     console.log(`ℹ️  使用代理连接 Telegram: ${proxyUrl}\n`);
+    console.log('ℹ️  若出现 TLS/socket 断开，可在 .env 设置 TELEGRAM_BOT_DIRECT=1 让 Telegram 直连，或运行加 --no-proxy\n');
   } else {
     console.log('ℹ️  未检测到代理配置，使用直连\n');
   }
 }
 
 const bot = new TelegramBot(TOKEN, botOptions);
+
+const ROOT = __dirname;
+
+/** @returns {Record<string, number>} */
+function loadCategoryChatMap() {
+  const empty = {};
+  const envJson = (process.env.TELEGRAM_CATEGORY_MAP || '').trim();
+  if (envJson) {
+    try {
+      const raw = JSON.parse(envJson);
+      return normalizeCategoryMap(raw);
+    } catch (e) {
+      console.warn('[ws-to-telegram] TELEGRAM_CATEGORY_MAP JSON 无效:', e.message);
+    }
+  }
+  const filePath = path.join(ROOT, 'telegram_category_map.json');
+  if (fs.existsSync(filePath)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      return normalizeCategoryMap(raw);
+    } catch (e) {
+      console.warn('[ws-to-telegram] telegram_category_map.json 无效:', e.message);
+    }
+  }
+  return empty;
+}
+
+function normalizeCategoryMap(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [k, v] of Object.entries(raw)) {
+    const key = String(k).trim();
+    if (!key) continue;
+    const n = typeof v === 'number' ? v : parseInt(String(v).trim(), 10);
+    if (!Number.isNaN(n)) out[key] = n;
+  }
+  return out;
+}
+
+const categoryChatMap = loadCategoryChatMap();
+
+function resolveChatIdForCategory(category) {
+  const cat = String(category || '').trim();
+  if (!cat) return null;
+  if (Object.prototype.hasOwnProperty.call(categoryChatMap, cat)) {
+    return categoryChatMap[cat];
+  }
+  if (Object.prototype.hasOwnProperty.call(categoryChatMap, 'default')) {
+    return categoryChatMap.default;
+  }
+  if (Object.keys(categoryChatMap).length === 0) {
+    return targetChatId;
+  }
+  return null;
+}
+
+function parseForwardContent(content) {
+  if (content == null) return null;
+  if (typeof content === 'object') return content;
+  const s = String(content).trim();
+  if (!s) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return { _plainText: s };
+  }
+}
+
+function wrapTradingViewEnvelope(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    return { type: 'message_received', message: { content: String(parsed) } };
+  }
+  if (parsed.type === 'message_received' && parsed.message) return parsed;
+  if (parsed.message && typeof parsed.message === 'object') {
+    return parsed.type ? parsed : { type: 'message_received', message: parsed.message };
+  }
+  return { type: 'message_received', message: parsed };
+}
+
+function buildForwardTelegramText(category, parsed) {
+  const cat = String(category || '').trim();
+  if (cat === 'tradingview') {
+    if (parsed && typeof parsed === 'object' && parsed._plainText && !parsed.type && !parsed.message) {
+      return `📊 *TradingView*\n\n${parsed._plainText}`;
+    }
+    return formatTVMessage(wrapTradingViewEnvelope(parsed));
+  }
+  if (cat === 'whisper') {
+    if (parsed && typeof parsed === 'object' && parsed._plainText) return parsed._plainText;
+    if (typeof parsed === 'string') return parsed;
+    if (parsed && typeof parsed.text === 'string') return parsed.text;
+    return '🚗 发车了！';
+  }
+  if (parsed && typeof parsed === 'object' && parsed._plainText) {
+    return parsed._plainText;
+  }
+  if (typeof parsed === 'string') return parsed;
+  return `📨 *${cat}*\n\n\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\``;
+}
 
 // 格式化消息内容
 function formatTVMessage(data) {
@@ -182,19 +307,79 @@ function formatTVMessage(data) {
 }
 
 // 发送消息到 Telegram
-async function sendToTelegram(message) {
+async function sendToTelegram(message, chatId = targetChatId) {
   try {
-    const sentMessage = await bot.sendMessage(targetChatId, message, {
+    const sentMessage = await bot.sendMessage(chatId, message, {
       parse_mode: 'Markdown'
     });
-    console.log(`✅ 消息已转发到 Telegram (消息 ID: ${sentMessage.message_id})`);
+    console.log(`✅ 消息已转发到 Telegram chat=${chatId} (消息 ID: ${sentMessage.message_id})`);
     return sentMessage;
   } catch (error) {
-    console.error('❌ 转发消息到 Telegram 失败:', error.message);
+    const msg = String(error.message || error);
+    console.error('❌ 转发消息到 Telegram 失败:', msg);
+    if (/TLS|socket disconnected|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(msg) && !disableProxy && !telegramBotDirect) {
+      console.error('   提示: 多为代理无法稳定转发 api.telegram.org 的 HTTPS，可在 .env 设置 TELEGRAM_BOT_DIRECT=1，或启动时加 --no-proxy');
+    }
     if (error.response) {
       console.error('   错误详情:', JSON.stringify(error.response.body, null, 2));
     }
     throw error;
+  }
+}
+
+let forwardServer = null;
+
+async function startForwardHttpServer() {
+  if (process.env.TELEGRAM_FORWARD_DISABLE === '1') {
+    console.log('ℹ️  已设置 TELEGRAM_FORWARD_DISABLE=1，跳过 HTTP 转发服务\n');
+    return;
+  }
+  const Fastify = require('fastify');
+  const port = parseInt(process.env.TELEGRAM_FORWARD_PORT || '3861', 10);
+  const fastify = Fastify({ logger: false });
+  await fastify.register(require('@fastify/cors'), { origin: '*' });
+
+  fastify.get('/health', async () => ({ ok: true }));
+
+  fastify.post('/forward', async (request, reply) => {
+    const t0 = Date.now();
+    const body = request.body || {};
+    const category = String(body.category || '').trim();
+    if (!category) {
+      return reply.status(400).send({ error: '缺少 category' });
+    }
+    const chatId = resolveChatIdForCategory(category);
+    if (chatId == null || Number.isNaN(chatId)) {
+      console.warn('[ws-to-telegram] /forward 未知 category，无映射:', category);
+      return reply.status(404).send({ error: `未知 category: ${category}，请在 TELEGRAM_CATEGORY_MAP 或 telegram_category_map.json 中配置` });
+    }
+    const parsed = parseForwardContent(body.content);
+    if (parsed == null) {
+      return reply.status(400).send({ error: '缺少 content 或内容为空' });
+    }
+    let text;
+    try {
+      text = buildForwardTelegramText(category, parsed);
+    } catch (e) {
+      console.error('[ws-to-telegram] /forward 格式化失败', category, e.message);
+      return reply.status(500).send({ error: String(e.message || e) });
+    }
+    try {
+      const sent = await sendToTelegram(text, chatId);
+      const preview = String(text || '').slice(0, 150).replace(/\s+/g, ' ');
+      console.log('[ws-to-telegram] /forward ok', 'ms=', Date.now() - t0, 'category=', category, 'chatId=', chatId, 'msgId=', sent.message_id, 'preview150=', preview);
+      return reply.send({ ok: true, message_id: sent.message_id, chat_id: chatId, category });
+    } catch (e) {
+      console.warn('[ws-to-telegram] /forward fail', 'ms=', Date.now() - t0, 'category=', category, e.message);
+      return reply.status(500).send({ error: String(e.message || e) });
+    }
+  });
+
+  await fastify.listen({ port, host: '0.0.0.0' });
+  forwardServer = fastify;
+  console.log(`[ws-to-telegram] HTTP 转发已启动 http://127.0.0.1:${port}  POST /forward  GET /health`);
+  if (Object.keys(categoryChatMap).length === 0) {
+    console.log('[ws-to-telegram] 未配置类目映射，/forward 将使用 WebSocket 默认群组 ID 作为所有 category 的目标');
   }
 }
 
@@ -287,8 +472,15 @@ process.on('SIGINT', () => {
   if (ws) {
     ws.close();
   }
-  console.log('✅ 已退出');
-  process.exit(0);
+  (async () => {
+    if (forwardServer) {
+      try {
+        await forwardServer.close();
+      } catch (_) { /* ignore */ }
+    }
+    console.log('✅ 已退出');
+    process.exit(0);
+  })();
 });
 
 // 启动连接
@@ -296,5 +488,13 @@ console.log('🚀 WebSocket 到 Telegram 转发服务启动');
 console.log(`   目标群组 ID: ${targetChatId}`);
 console.log(`   WebSocket URL: ${WS_URL}\n`);
 
-connectWebSocket();
+(async () => {
+  try {
+    await startForwardHttpServer();
+  } catch (e) {
+    console.error('❌ HTTP 转发服务启动失败:', e.message || e);
+    process.exit(1);
+  }
+  connectWebSocket();
+})();
 

@@ -16,6 +16,7 @@
   "scripts": {
     "gemini": "node gemini_client.js",
     "qwen": "node qwen_client.js",
+    "totg": "node ws-to-telegram.js",
     "baidu-hot": "node analysis_img.js",
     "gen-doc": "echo 'WARNING: `npm run gen-doc` is deprecated. Use `npm run doc` instead.' && npm run doc",
     "doc": "jsdoc2md --files src/telegram.js --template doc/api.hbs > doc/api.md",
