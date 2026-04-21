@@ -17,7 +17,9 @@
  *    - TELEGRAM_FORWARD_PORT: HTTP 端口，默认 3861
  *    - TELEGRAM_FORWARD_DISABLE=1: 不启动 HTTP 服务
  *    - TELEGRAM_BOT_DIRECT=1: 仅 Telegram Bot API 不走 HTTP(S)_PROXY（避免代理 TLS 握手失败；
- *      WebSocket 仍可能使用系统代理，需全局禁代理请用 --no-proxy）
+ *      国内网络直连常 ETIMEDOUT，此时应去掉该项并走代理）
+ *    - TELEGRAM_BOT_PROXY: 仅 Bot API 使用的代理 URL（如 http://127.0.0.1:7890），优先于 HTTP_PROXY
+ *    - TELEGRAM_REQUEST_TIMEOUT_MS: Bot API 请求超时毫秒，默认 90000
  *
  * 2. 运行: node ws-to-telegram.js
  *
@@ -122,21 +124,28 @@ if (!TOKEN) {
 }
 
 // 创建机器人实例
+const telegramReqTimeout = Math.max(5000, parseInt(process.env.TELEGRAM_REQUEST_TIMEOUT_MS || '90000', 10));
 const botOptions = {
   polling: false,  // 不需要 polling，只用于发送消息
-  request: {}
+  request: {
+    timeout: telegramReqTimeout,
+  },
 };
 
-/** 仅 Bot API 直连：全局仍可有 HTTP_PROXY（给 Gemini 等用），避免 Telegram 经代理 TLS 失败 */
+/** 仅 Bot API 直连：全局仍可有 HTTP_PROXY（给 Gemini 等用）；国内直连 Telegram 常会 ETIMEDOUT */
 const telegramBotDirect = process.env.TELEGRAM_BOT_DIRECT === '1' || process.env.TELEGRAM_API_DIRECT === '1';
+const telegramBotProxy = (process.env.TELEGRAM_BOT_PROXY || '').trim();
 
 // 配置代理（如果不禁用）
 if (disableProxy) {
   botOptions.request.proxy = false;
   console.log('ℹ️  已禁用代理，Telegram 使用直连\n');
+} else if (telegramBotProxy) {
+  botOptions.request.proxy = telegramBotProxy;
+  console.log(`ℹ️  Telegram Bot 使用 TELEGRAM_BOT_PROXY: ${telegramBotProxy}\n`);
 } else if (telegramBotDirect) {
   botOptions.request.proxy = false;
-  console.log('ℹ️  Telegram Bot API 使用直连（TELEGRAM_BOT_DIRECT=1），不经过 HTTP_PROXY/HTTPS_PROXY\n');
+  console.log('ℹ️  Telegram Bot API 使用直连（TELEGRAM_BOT_DIRECT=1）。若出现 ETIMEDOUT，请去掉该项并配置 TELEGRAM_BOT_PROXY 或 HTTP_PROXY\n');
 } else {
   const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
   const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
@@ -145,9 +154,9 @@ if (disableProxy) {
   if (proxyUrl) {
     botOptions.request.proxy = proxyUrl;
     console.log(`ℹ️  使用代理连接 Telegram: ${proxyUrl}\n`);
-    console.log('ℹ️  若出现 TLS/socket 断开，可在 .env 设置 TELEGRAM_BOT_DIRECT=1 让 Telegram 直连，或运行加 --no-proxy\n');
+    console.log('ℹ️  若 TLS/socket 异常，可单独设 TELEGRAM_BOT_PROXY；或与全局代理冲突时试 TELEGRAM_BOT_DIRECT=1（仅在网络能直连 Telegram 时）\n');
   } else {
-    console.log('ℹ️  未检测到代理配置，使用直连\n');
+    console.log('ℹ️  未检测到代理配置，Telegram 使用直连（国内环境易 ETIMEDOUT，请配置 TELEGRAM_BOT_PROXY 或 HTTP_PROXY）\n');
   }
 }
 
@@ -214,7 +223,10 @@ function parseForwardContent(content) {
   const s = String(content).trim();
   if (!s) return null;
   try {
-    return JSON.parse(s);
+    const v = JSON.parse(s);
+    // 顶层为数字/布尔/null/字符串时，按「纯文本」转发，避免误包成 TV 结构
+    if (v !== null && typeof v === 'object') return v;
+    return { _plainText: typeof v === 'string' ? v : String(v) };
   } catch {
     return { _plainText: s };
   }
@@ -317,8 +329,14 @@ async function sendToTelegram(message, chatId = targetChatId) {
   } catch (error) {
     const msg = String(error.message || error);
     console.error('❌ 转发消息到 Telegram 失败:', msg);
-    if (/TLS|socket disconnected|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(msg) && !disableProxy && !telegramBotDirect) {
-      console.error('   提示: 多为代理无法稳定转发 api.telegram.org 的 HTTPS，可在 .env 设置 TELEGRAM_BOT_DIRECT=1，或启动时加 --no-proxy');
+    if (/ETIMEDOUT|ESOCKETTIMEDOUT/i.test(msg)) {
+      if (telegramBotDirect || !botOptions.request.proxy) {
+        console.error('   提示: 直连 Telegram 超时。请配置 TELEGRAM_BOT_PROXY=http://127.0.0.1:7890（或你的可用代理），并去掉 TELEGRAM_BOT_DIRECT=1');
+      } else {
+        console.error('   提示: 经代理仍超时，请确认本地代理已启动、端口正确，或换 TELEGRAM_BOT_PROXY 指向可用节点');
+      }
+    } else if (/TLS|socket disconnected|ECONNRESET/i.test(msg) && !disableProxy && botOptions.request.proxy) {
+      console.error('   提示: 多为代理对 api.telegram.org 的 HTTPS 不稳定，可尝试 TELEGRAM_BOT_PROXY 单独指定；若你所在网络可直连 Telegram 再试 TELEGRAM_BOT_DIRECT=1');
     }
     if (error.response) {
       console.error('   错误详情:', JSON.stringify(error.response.body, null, 2));
@@ -353,6 +371,7 @@ async function startForwardHttpServer() {
       console.warn('[ws-to-telegram] /forward 未知 category，无映射:', category);
       return reply.status(404).send({ error: `未知 category: ${category}，请在 TELEGRAM_CATEGORY_MAP 或 telegram_category_map.json 中配置` });
     }
+    console.log('[ws-to-telegram] /forward req', 'category=', category, 'chatId=', chatId);
     const parsed = parseForwardContent(body.content);
     if (parsed == null) {
       return reply.status(400).send({ error: '缺少 content 或内容为空' });
@@ -370,8 +389,12 @@ async function startForwardHttpServer() {
       console.log('[ws-to-telegram] /forward ok', 'ms=', Date.now() - t0, 'category=', category, 'chatId=', chatId, 'msgId=', sent.message_id, 'preview150=', preview);
       return reply.send({ ok: true, message_id: sent.message_id, chat_id: chatId, category });
     } catch (e) {
-      console.warn('[ws-to-telegram] /forward fail', 'ms=', Date.now() - t0, 'category=', category, e.message);
-      return reply.status(500).send({ error: String(e.message || e) });
+      const em = String(e.message || e);
+      console.warn('[ws-to-telegram] /forward fail', 'ms=', Date.now() - t0, 'category=', category, 'chatId=', chatId, em);
+      if (/chat not found/i.test(em)) {
+        console.warn('   提示: chatId 与当前机器人不匹配（未入群/ID 错/应用了别的群的 ID）。请核对 TELEGRAM_CATEGORY_MAP 与 TEST_GROUP_ID，群一般为 -100… 开头');
+      }
+      return reply.status(500).send({ error: em });
     }
   });
 
