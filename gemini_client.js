@@ -9,11 +9,14 @@
  */
 const path = require('path');
 const fs = require('fs');
+const { execSync } = require('child_process');
 const { Readable } = require('stream');
 const Fastify = require('fastify');
 const rp = require('@cypress/request-promise');
 
-require('dotenv').config();
+// 与 dotenv 默认一致：先读 env，再读 .env（后者覆盖同名变量）
+require('dotenv').config({ path: path.join(__dirname, 'env') });
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 // 代理修复（与 ws-to-telegram.js 一致）
 const disableProxy = process.env.NO_PROXY === '1' || process.argv.includes('--no-proxy') || process.argv.includes('-n');
@@ -39,6 +42,38 @@ if (!disableProxy) {
 const ROOT = __dirname;
 const PROMPTS_DIR = path.join(ROOT, 'prompts');
 const PORT = parseInt(process.env.GEMINI_SERVICE_PORT || '3860', 10);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 结束占用该 TCP 监听端口的进程（避免 EADDRINUSE）。传 --no-kill-port 可跳过。 */
+function killListenersOnPort(port) {
+  if (process.argv.includes('--no-kill-port')) return;
+  let out = '';
+  try {
+    out = execSync(`lsof -tiTCP:${port} -sTCP:LISTEN`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return;
+  }
+  if (!out) return;
+  const pids = [...new Set(out.split(/\n/).map((s) => s.trim()).filter(Boolean))];
+  const myPid = String(process.pid);
+  for (const pidStr of pids) {
+    if (pidStr === myPid) continue;
+    const pid = parseInt(pidStr, 10);
+    if (!Number.isFinite(pid)) continue;
+    try {
+      process.kill(pid, 'SIGTERM');
+      console.log(`[gemini_client] 已结束占用端口 ${port} 的进程 PID=${pid}`);
+    } catch (e) {
+      if (e && e.code !== 'ESRCH') console.warn('[gemini_client] 无法结束 PID=', pidStr, e.message || e);
+    }
+  }
+}
 
 function getPrompt(role) {
   const safe = role.replace(/[^a-z0-9_]/gi, '');
@@ -335,6 +370,8 @@ async function main() {
     }
   });
 
+  killListenersOnPort(PORT);
+  await sleep(200);
   await fastify.listen({ port: PORT, host: '0.0.0.0' });
   console.log(`[gemini_client] Gemini 服务已启动 http://127.0.0.1:${PORT}`);
   console.log('[gemini_client] POST /chat  JSON: { role, message?, files?: [{ path }|{ data, mime_type }] } 或 multipart: role, message, files');
